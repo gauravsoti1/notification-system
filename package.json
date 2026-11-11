@@ -22,7 +22,11 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "migrate": "node-pg-migrate -j ts",
+    "migrate:up": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -j ts up",
+    "migrate:down": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -j ts down",
+    "test:db": "node --test tests/schema.test.ts"
   },
   "dependencies": {
     "express": "^5.3.0",
@@ -39,6 +43,7 @@
     "@types/pg": "^8.23.1",
     "eslint": "^10.14.0",
     "eslint-config-prettier": "^10.1.8",
+    "node-pg-migrate": "^9.0.0",
     "pino-pretty": "^13.2.0",
     "prettier": "^3.9.10",
     "tsx": "^4.23.15",
