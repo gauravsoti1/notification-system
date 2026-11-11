@@ -2,6 +2,42 @@
 
 Grouped by branch, newest branch first. Each branch section has a heading with the branch name and a one-line summary.
 
+## NS-11: Database migrations for Postgres
+
+### Q: Why archive users instead of deleting them, and why is the `notifications.user_id` foreign key `ON DELETE RESTRICT`?
+
+A: Users are archived (`users.archived_at` is set) and never hard-deleted, so their notification history stays as a trail. `RESTRICT` backs that up: deleting a user who has notifications fails with an FK violation, where `CASCADE` would silently delete the history.
+
+- Where: `migrations/1794365209383_create-users.ts` (`archived_at`) and `migrations/1794371469906_create-notifications.ts` (`references: 'users'`, `onDelete: 'RESTRICT'`).
+- `archived_at` is a nullable `timestamptz`: `NULL` means active, a timestamp means archived and records when. A boolean would lose the "when".
+- The app must filter `archived_at IS NULL` when choosing who to notify. The database does not enforce that.
+- `ON DELETE` options in short:
+  - `CASCADE`: deleting the user deletes their notifications.
+  - `RESTRICT`: blocks the delete while notifications exist. Choose this to keep an audit trail.
+  - `SET NULL` would not work here, because `user_id` is `NOT NULL`.
+- Trade-off: an archived user keeps their email and phone in the table. If a real "erase my data" request (e.g. GDPR) applies, archiving is not enough and you would need to anonymise the row. That is a later decision.
+- The choice is also recorded as a comment on NS-11 in Jira.
+- Reasoning is general database design knowledge, not checked against the Postgres docs in this session.
+
+### Q: Which migration tool should we use, and why not just use an ORM straight away?
+
+A: Use **node-pg-migrate** (Postgres-only, plain SQL or TS migration files, works with the `pg` driver) and skip the ORM for now. A migration tool and an ORM are separate choices. Many ORMs bundle a migrator (Prisma Migrate, Drizzle Kit, TypeORM, Sequelize), which is why they get mixed up.
+
+- Why not an ORM yet:
+  - Notification workloads are SQL-shaped: `SELECT ... FOR UPDATE SKIP LOCKED` for claiming work, partial indexes on `status`, `ON CONFLICT` for idempotency keys, JSONB payloads, maybe time partitioning. ORMs handle these awkwardly, so you often end up writing raw SQL anyway.
+  - Bulk inserts and status updates are hot paths, and an ORM makes it harder to see the exact SQL that runs.
+  - With a SQL-first tool the migration file is the schema change. Auto-generated diffs from ORM models can surprise you (a rename can become drop + add) and need review anyway.
+  - Lock-in: schema ends up tied to the ORM's model definitions and tooling (Prisma needs a generated client). This repo is ESM with `module: nodenext` and `.ts` import extensions, so extra friction matters.
+  - Writing the DDL yourself is worth it for learning on a ticket-by-ticket project.
+- When an ORM is the right call: lots of CRUD across many related entities, a team that wants model-driven schema, or type safety as a top priority.
+- If type safety is wanted without an ORM, add **Kysely** (typed query builder) later. **Drizzle** is the most SQL-like, ESM-friendly ORM option, and Drizzle Kit handles its migrations.
+- Alternatives:
+  - dbmate / Flyway: language-agnostic plain SQL, but a separate binary or JVM.
+  - Knex migrations: good if Knex is also the query builder, heavier otherwise.
+  - Prisma Migrate: most lock-in, generated client.
+- Suggested setup: add `pg` and `node-pg-migrate`, put `.sql` migrations in `migrations/`, add `migrate:up`, `migrate:down` and `migrate:create` scripts reading the Postgres vars from `.env`, and run migrations as a CLI step, not on app start.
+- General knowledge and a judgement call, not checked against the tools' docs in this session. It depends on how much the project leans on CRUD versus queue-style SQL.
+
 ## NS-10: Express + TypeScript setup with config, logging, error handler, /health
 
 ### Q: Why does the build need a different tsconfig (`tsconfig.build.json`)?
