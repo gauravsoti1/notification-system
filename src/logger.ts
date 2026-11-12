@@ -1,6 +1,6 @@
 import { pino } from 'pino';
 import { pinoHttp } from 'pino-http';
-import { config } from './config.ts';
+import { config } from './envConfig.ts';
 
 export const logger = pino({
   level: config.LOG_LEVEL,

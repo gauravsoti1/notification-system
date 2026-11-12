@@ -2,6 +2,112 @@
 
 Grouped by branch, newest branch first. Each branch section has a heading with the branch name and a one-line summary.
 
+## NS-13: Publish to RabbitMQ and worker logs a fake send
+
+### Q: How do I stop a bad message body or an unexpected error from crashing the worker?
+
+A: Treat the two causes differently. A malformed body is permanent, so validate it and drop it. An unexpected error such as the database being down is transient, so catch it in the consumer callback and log it.
+
+- **Bad body:** in `src/jobQueue/handleNotification.ts`, check `z.uuid().safeParse(notificationId)` before the `SELECT`; if it fails, `logger.warn(...)` and `return`. Without the `return` Postgres still throws `invalid input syntax for type uuid`. Retrying a malformed message never helps.
+- **Unexpected error:** in `src/jobQueue/worker.ts`, wrap `handleMessage(msg)` in `try/catch` and `logger.error({ err }, ...)`. Without it the rejected promise in the async callback is unhandled and Node exits the worker. The handler itself still lets errors propagate, so its unit test stays valid.
+- **Limit with auto-ack (`noAck: true`):** the message is already deleted on delivery, so a failed message is lost and the row stays `pending`. Manual ack with nack/requeue or a dead-letter queue (the next phase, NS-15) is the real fix.
+- Pino takes the object first, then the message: `logger.warn({ body }, 'text')`. `logger.warn('text', value)` without a `%s` drops the value.
+- General Node/RabbitMQ knowledge, not checked against docs in this session.
+
+### Q: Why does the worker need to load the row, if an `UPDATE` alone is enough for the fake send?
+
+A: It isn't needed for the fake send, but the ticket asks for it because the message carries only the id, and a real send needs the data in the row.
+
+- **Data to send:** `channel` (which sender), `payload.message` (content) and `user_id` (to look up the recipient). The `SELECT` in `handleNotification.ts` loads these and the `FAKE SEND` log shows them.
+- **Source of truth:** the queue holds an id, not a copy of the payload, so the worker sees the current row, not a stale one.
+- **Skip checks:** a row already `sent` is skipped, which protects against duplicate deliveries once manual acks can redeliver a message. A missing row logs a warning and returns before the `UPDATE`.
+- General design reasoning, not from docs.
+
+### Q: Should I use mocks or the real services in tests, and which test tool is recommended for Node?
+
+A: Use both. Mocked unit tests are fast and check one piece of logic; integration tests against the real services prove the pieces work together. For the tool: no single standard. `node:test` is built in, Vitest is the usual pick for new TypeScript/ESM projects, and Jest is the oldest and best known.
+
+- **Layout here:** `tests/unit/handleNotification.test.ts` (fake `pool` and `logger`, no Docker) and `tests/integration/` (`schema.test.ts`, `worker.test.ts`, real Compose Postgres and RabbitMQ).
+- **Why a refactor was needed:** `worker.ts` connected and consumed on import, so nothing could be called with a fake. The handler was extracted into `createMessageHandler({ pool, logger })` so dependencies are passed in.
+- **Integration trade-offs:** they catch real behaviour (queue settings, UUID column, `updated_at` trigger) but need Docker, are slower, write to the dev database (cleaned up afterwards), and conflict with a running dev worker.
+- **Chosen tool:** Vitest (`npm run test:unit`, `test:integration`, `test:db`, `test:worker`). `supertest` is the usual add-on for testing Express routes in-process.
+- General knowledge, not checked against current docs.
+
+### Q: What does "structured" logging mean, and how do I check an `UPDATE` succeeded and log it?
+
+A: Structured means the log line is a JSON object with named fields, not text with values mixed in. To check an `UPDATE`, read `result.rowCount`.
+
+- `logger.info({ notificationId }, 'notification marked sent')` prints `{"level":30,...,"notificationId":"...","msg":"notification marked sent"}` (pretty-printed in development). A log tool can filter on `notificationId` and the message stays constant, so it can be counted or alerted on.
+- **Success check:** pg sets `rowCount` to the rows changed by an `UPDATE`, with no `RETURNING` needed. `1` means it matched; `0` means the id isn't in the table. A failed query throws instead of returning a count.
+- Put the object first and the message second; pino reads them in that order.
+- Source: pg and pino behaviour from general knowledge, not checked against docs in this session.
+
+### Q: Why was my worker query `INSERT INTO notifications (status) = "Success" where id = $1` wrong?
+
+A: It isn't valid SQL, and it used the wrong statement.
+
+- `INSERT` creates a new row; changing an existing row needs `UPDATE notifications SET status = $1 WHERE id = $2`.
+- In Postgres double quotes mean an identifier (a column name); string values take single quotes. Statuses here are lowercase (`pending`, `sent`).
+- Statuses are kept in `src/notificationStatus.ts` as a const object plus a derived type, not a TS `enum`, because the project uses Node's type stripping (`erasableSyntaxOnly`), which doesn't support `enum`. The database has no CHECK on `status`, so the app owns the list.
+
+### Q: I ran the worker and it consumed my message without updating the notification. Is it lost?
+
+A: The message is gone, but the row is still in Postgres as `pending`, so nothing is lost. Re-publish the row's id to the queue to process it again.
+
+- **Why:** `noAck: true` (auto-ack) deletes a message the moment it is delivered, whether or not the worker finished its work. The ticket says to use it for now.
+- **Re-publish:** Management UI, queue `notifications.email`, **Publish message**, payload = the row's `id` (default exchange routes by queue name). Or post a new notification, which makes a second row.
+- **Next phase:** manual ack, where the worker acks only after the row is updated and an unacked message is redelivered if the worker dies.
+- General RabbitMQ knowledge, not checked against docs in this session.
+
+### Q: How can I see what a message in the queue contains?
+
+A: Management UI at `localhost:15672`: **Queues** → click the queue → **Get messages** → set **Ack Mode** to `Nack message requeue true` → **Get Message(s)**.
+
+- A real `Ack` mode consumes and deletes the messages. `Nack message requeue true` is a peek: it returns the message and puts it back, marking it redelivered.
+- Here the body is just the notification id (36 characters, a UUID), not JSON; the worker loads the row from Postgres. The properties list `delivery_mode` only if the publisher set `persistent`.
+- A stray message such as `First email` came from the old `GET /notifications/test` debug route or the UI's Publish box, not from `POST /notifications`.
+
+### Q: Why is `src/rabbitmq.ts` a poor module name, and what are tool-agnostic alternatives?
+
+A: It names the tool, not the role. Prefer a name that says what the module does, so a broker change touches only its inside.
+
+- Options: `queue.ts`, `messaging.ts`, `jobQueue.ts` (messages are work to do, i.e. commands, not events). The repo uses the `src/jobQueue/` folder: `config.ts` (queue name and `queueOptions` in one shared place), `index.ts` (publisher, `enqueue`), `worker.ts` (consumer), `handleNotification.ts`.
+- Export tool-agnostic function names too (`enqueue`, not `publishToRabbit`). A command-vs-event distinction is an interview talking point.
+- Design opinion, not from docs.
+
+### Q: What does `persistent: true` on `sendToQueue` do, and if my queue already writes to disk, is that not enough?
+
+A: For our queue it is enough. `notifications.email` is a quorum queue (`x-queue-type: quorum` in `src/jobQueue.ts`), and quorum queues write every message to disk whatever the `persistent` flag says. The flag only matters on classic queues, so adding it is cheap insurance and matches the ticket, not a fix for a current gap.
+
+- **Two separate settings:** `durable: true` on `assertQueue` means the queue definition survives a broker restart. `persistent: true` (AMQP `delivery_mode: 2`) on the message means the message is written to disk. On a classic queue you need both: a durable queue with non-persistent messages comes back after a restart, but empty.
+- **Quorum queues:** they always persist messages, so the flag is ignored. They also replicate through a Raft log, which is why they are the recommended durable queue type.
+- **Why still set it:** the ticket asks for a persistent message; it keeps the publisher correct if the queue is ever redeclared as classic; and it states the intent in the code. Change: `channel.sendToQueue(queue, Buffer.from(msg), { persistent: true })`.
+- **What it does not guarantee:** a message can still be lost between `sendToQueue` returning and the broker writing it, because publishing is fire-and-forget. Closing that gap needs publisher confirms (`createConfirmChannel()` and waiting for the broker's ack). `sendToQueue` also returns `false` when the channel's buffer is full, which `enqueue` currently ignores.
+- **Why the Management UI showed no `delivery_mode`:** the messages were published without the option, so the properties were empty.
+- General RabbitMQ/AMQP knowledge, not checked against the docs in this session.
+
+### Q: Why did connecting to RabbitMQ fail with `Expected ConnectionOpenOk; got ConnectionClose`, and what is a vhost?
+
+A: `RABBITMQ_URL` in `.env` ended in `/vhost`, which asked the broker for a virtual host called `vhost`. That vhost does not exist (only the default `/` does), so RabbitMQ closed the connection. A vhost is a separate, named "space" inside one RabbitMQ server.
+
+- **What a vhost is:** think of one RabbitMQ server as a building and vhosts as locked rooms. Each room has its own queues, exchanges and permissions, and nothing in one room can see another. Teams or environments (e.g. `staging` and `prod`) can share one server without their queues colliding. A fresh RabbitMQ has one room, called `/`.
+- **How the URL names it:** the path after the port is the vhost: `amqp://user:pass@localhost:5672/<vhost>`. No path means the default `/`. Because `/` is also the URL separator, the default can be written `%2F`. A trailing slash alone (`.../`) asks for an empty-named vhost, which fails the same way.
+- **Why the error looks odd:** the AMQP handshake is: connect, authenticate, then "open vhost". The broker refused at the last step, which is why the message says it expected `ConnectionOpenOk` (the "vhost opened" reply) and got `ConnectionClose`. A wrong username or password fails earlier, so this error points at the vhost, not the credentials.
+- **Fix:** remove `/vhost` from `RABBITMQ_URL` in `.env` (`amqp://ns_rabbitmq:<password>@localhost:5672`) and restart `npm run dev`. To use a custom vhost instead, create it and grant the user access: `rabbitmqctl add_vhost <name>`, then `rabbitmqctl set_permissions -p <name> <user> ".*" ".*" ".*"`.
+- **Other fix on this branch:** `ECONNREFUSED 127.0.0.1:5672` happened because the old `ns-rabbitmq` container had no published ports. `docker compose up -d` recreated it from `docker-compose.yaml`, which already had the `5672:5672` mapping.
+- General RabbitMQ/AMQP knowledge, not checked against the docs in this session.
+
+### Q: How is a RabbitMQ queue named, and why is it confusing that both AMQP and notifications use the word "channel"?
+
+A: A queue name is just a string we choose; RabbitMQ gives it no meaning. The ticket's `notifications.send` is an example ("e.g."). The two "channel"s are unrelated things.
+
+- **Naming:** the common convention is dotted `<domain>.<action>`, so `notifications.send` reads as "jobs to send a notification". The name lives in one constant, `SEND_QUEUE` in `src/rabbitmq.ts`, so the API and worker agree. RabbitMQ rejects redeclaring a queue with different settings (e.g. durable vs not), so changing settings later needs a new queue name or deleting the old one.
+- **One queue or one per channel:** a single queue is simplest. Per-channel queues (`notifications.email`, `.sms`, `.push`) let a slow provider not block the others and let each be scaled and retried on its own, at the cost of routing in the publisher. Email-only for now makes `notifications.email` a natural fit; this is a design choice, not something RabbitMQ requires.
+- **AMQP channel:** a lightweight session multiplexed over one TCP connection. You publish and consume through a channel (`createChannel()` in `connect()`), not directly on the connection. Ticket step 1 means this one.
+- **Notification channel:** the delivery medium: `email`, `sms` or `push`. It is the `channel` column on `notifications` and the `channel` field validated in `src/api/notifications.ts`.
+- To keep them apart in code and notes, say "AMQP channel" for the first and "notification channel" for the second.
+- General RabbitMQ/AMQP knowledge, not checked against the docs in this session.
+
 ## NS-12: POST /notifications validates and saves
 
 ### Q: What HTTP status codes did we use in NS-12, what do they mean, and why did we use them?

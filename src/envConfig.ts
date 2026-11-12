@@ -20,6 +20,7 @@ const envSchema = z.object({
 
   RABBITMQ_USER: z.string().min(1),
   RABBITMQ_PASSWORD: z.string().min(1),
+  RABBITMQ_URL: z.url({ protocol: /^amqp$/ }),
 });
 
 const parsed = envSchema.safeParse(process.env);

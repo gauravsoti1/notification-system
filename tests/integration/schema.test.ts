@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from 'vitest';
 import pg from 'pg';
-import { config } from '../src/config.ts';
+import { config } from '../../src/envConfig.ts';
 
 // Postgres error codes (https://www.postgresql.org/docs/current/errcodes-appendix.html)
 const FOREIGN_KEY_VIOLATION = '23503';
@@ -27,8 +27,8 @@ async function createNotification(userId: string, status = 'pending'): Promise<s
 }
 
 describe('database schema', () => {
-  before(() => client.connect());
-  after(() => client.end());
+  beforeAll(() => client.connect());
+  afterAll(() => client.end());
 
   // Every test runs in its own transaction that is rolled back, so no data is left behind.
   beforeEach(() => client.query('BEGIN'));

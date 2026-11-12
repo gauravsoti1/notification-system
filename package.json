@@ -15,7 +15,7 @@
   "type": "module",
   "main": "dist/app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npm run test:unit",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/app.js",
     "dev": "tsx watch src/app.ts",
@@ -26,9 +26,16 @@
     "migrate": "node-pg-migrate -j ts",
     "migrate:up": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -j ts up",
     "migrate:down": "node --env-file=.env node_modules/node-pg-migrate/bin/node-pg-migrate.js -j ts down",
-    "test:db": "node --test tests/schema.test.ts"
+    "test:unit": "vitest run tests/unit",
+    "test:db": "vitest run tests/integration/schema.test.ts",
+    "test:worker": "vitest run tests/integration/worker.test.ts",
+    "test:integration": "vitest run tests/integration",
+    "test:watch": "vitest tests/unit",
+    "worker": "tsx src/jobQueue/worker.ts",
+    "dev:worker": "tsx watch src/jobQueue/worker.ts"
   },
   "dependencies": {
+    "amqplib": "^2.3.1",
     "express": "^5.3.0",
     "pg": "^8.23.1",
     "pino": "^10.4.0",
@@ -48,6 +55,7 @@
     "prettier": "^3.9.10",
     "tsx": "^4.23.15",
     "typescript": "~6.0",
-    "typescript-eslint": "^8.72.1"
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.1.0"
   }
 }
