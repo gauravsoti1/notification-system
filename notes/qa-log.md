@@ -2,6 +2,53 @@
 
 Grouped by branch, newest branch first. Each branch section has a heading with the branch name and a one-line summary.
 
+## NS-12: POST /notifications validates and saves
+
+### Q: What HTTP status codes did we use in NS-12, what do they mean, and why did we use them?
+
+A: 202, 400, 404, 500 and 503 (plus 200 for a healthy `/health`). The first digit is the class: 2xx means success, 4xx means the client sent something wrong, 5xx means the server failed.
+
+- **202 Accepted** (`POST /notifications`, `src/api/notifications.ts`): the request was valid and stored, but the work is not finished. The row is saved as `pending`; sending happens later through the queue. 201 Created would say the notification exists as a finished thing, and 200 would hide that it is asynchronous. The body is `{ id, status, created_at }` so the client can look it up later.
+- **400 Bad Request** (invalid body): the client's data failed validation: `user_id` not a UUID, `channel` not `email`/`sms`/`push`, or a missing field. `src/api/validateBody.ts` returns it with the zod error details, and `src/errorHandler.ts` maps any `ZodError` to 400. It is the client's mistake, so retrying the same request will never work.
+- **404 Not Found** (unknown or archived user): the body was valid, but the user it points to does not exist or is archived (`archived_at IS NOT NULL`), so nothing was inserted. Unknown and archived users get the same response. 422 Unprocessable Content would also be defensible for a valid request that refers to something missing. We chose 404 because the missing thing is the user.
+- **500 Internal Server Error** (anything unexpected, e.g. a database error): a bug or failure on our side. `errorHandler` returns the fixed message `Internal Server Error` and never exposes `err.message`; the real error goes to the log. We do not return 500 for expected cases like a bad body or an unknown user. Those are 4xx.
+- **503 Service Unavailable** (`/health` when the DB check fails): the server is running but cannot do its job because a dependency (Postgres) is down. Load balancers and orchestrators treat it as "take this instance out of rotation", which is the point of a health endpoint. It is not a 500, because retrying later may work. Planned in `src/app.ts`; not yet implemented when this note was added.
+- **200 OK** (`/health` when healthy): plain success with `{ status: 'ok' }`.
+- Rule of thumb: pick 4xx when the client can fix it, 5xx when only we can.
+- General HTTP knowledge (RFC 9110), not checked against the spec or docs in this session. Which code fits "valid request, missing referenced user" (404 vs 422) is a judgement call.
+
+### Q: How do I add a DB check to `/health` and close the pg pool on shutdown (`pool.end()`)?
+
+A: In `src/app.ts`, make `/health` run `SELECT 1` through the shared pool (200 `{ status: 'ok' }` on success, 503 `{ status: 'error' }` on failure). For shutdown, keep the value returned by `app.listen`, and on `SIGTERM`/`SIGINT` call `server.close()` first, then `pool.end()` inside its callback.
+
+- `/health`: log the error yourself with `logger.error({ err }, ...)`, because `/health` is excluded from request logging and a failure would otherwise be invisible. Return no error details to the client.
+- Shutdown order matters: `server.close()` stops new requests and waits for in-flight ones, then `pool.end()` waits for checked-out clients to be released and closes the connections.
+- Add a forced-exit timer (`setTimeout(() => process.exit(1), 10_000).unref()`), because open keep-alive connections can stop `server.close()` from finishing.
+- Test: stop Postgres (`docker compose stop postgres`) and expect 503, start it again and expect `ok` (the pool reconnects), then Ctrl+C and expect a clean exit.
+- This was guidance; the code was not yet written or run when this note was added. General knowledge of `pg` and Node, not checked against the docs in this session.
+
+### Q: How was the "unknown or archived `user_id` gives a 500 (FK error 23503)" problem fixed?
+
+A: By not tripping the foreign key at all, not by catching `23503`. The insert selects from `users`, so a missing or archived user inserts nothing and the handler returns 404.
+
+- In `src/api/notifications.ts`: `INSERT INTO notifications (...) SELECT id, $2::varchar, $3::jsonb, 'pending', 0 FROM users WHERE id = $1 AND archived_at IS NULL RETURNING id, status, created_at`.
+- Zero rows returned means 404 `User not found`. Success returns 202 with the new id.
+- Tested against the real database: unknown user and archived user both gave 404 and created no row.
+- Gap: if the FK ever trips another way (e.g. a user hard-deleted between check and insert), it still becomes a 500 through `errorHandler`. Unlikely, because users are archived, never deleted.
+- Side effect: unknown and archived users get the same 404 message. Telling them apart would need a second query.
+- `user_id` is also validated with `z.uuid()`, so a non-UUID string returns 400 instead of Postgres error `22P02` (a 500).
+
+### Q: Where should the pg client be initialised so it isn't created again and again in the API?
+
+A: In its own module, `src/db.ts`, which exports one `pg.Pool`. Modules are evaluated once, so every `import { pool } from '../db.ts'` shares the same instance, the same way `config.ts` and `logger.ts` work.
+
+- Use a `Pool`, not a `Client`. A `Client` is one connection running one query at a time and does not reconnect; a `Pool` hands out connections per query, which suits concurrent requests.
+- The pool connects lazily on the first query, so importing it never fails if Postgres is down.
+- Add `pool.on('error', ...)` for idle connection errors, or a Postgres restart can crash the process.
+- Use `pool.query(...)` for single statements; for transactions use `pool.connect()` and `client.release()` in a `finally`.
+- `src/app.ts` also needed `app.use(express.json())`, otherwise `req.body` is `undefined` and every POST fails validation.
+- General knowledge of `pg` and Express, not checked against the docs in this session.
+
 ## NS-11: Database migrations for Postgres
 
 ### Q: Why archive users instead of deleting them, and why is the `notifications.user_id` foreign key `ON DELETE RESTRICT`?
