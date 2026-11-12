@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { config } from './config.ts';
+import { config } from './envConfig.ts';
 import { logger } from './logger.ts';
 
 // One pool for the whole app. Modules are evaluated once, so every import shares this instance.

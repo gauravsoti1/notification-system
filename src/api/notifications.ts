@@ -2,10 +2,11 @@ import express, { type Request, type Response } from 'express';
 import z from 'zod';
 import { pool } from '../db.ts';
 import { validateBody } from './validateBody.ts';
+import { enqueue } from '../jobQueue/index.ts';
 
 export const router = express.Router({ caseSensitive: true, strict: true });
 
-const payloadSchema = z.object({
+export const payloadSchema = z.object({
   message: z.string(),
 });
 
@@ -35,6 +36,8 @@ router.post('/', validateBody(postNotificationsSchema), async (req: Request, res
     res.status(404).json({ success: false, error: 'User not found' });
     return;
   }
+
+  enqueue(rows[0].id);
 
   res.status(202).json(rows[0]);
 });

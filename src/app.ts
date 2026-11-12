@@ -1,5 +1,5 @@
 import express, { type Express, type Request, type Response } from 'express';
-import { config } from './config.ts';
+import { config } from './envConfig.ts';
 import { errorHandler } from './errorHandler.ts';
 import { httpLogger, logger } from './logger.ts';
 import { router as notificationsApiRouter } from './api/notifications.ts';
