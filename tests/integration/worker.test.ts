@@ -35,6 +35,27 @@ async function createPendingNotification(): Promise<string> {
   return rows[0]!.id;
 }
 
+async function startWorker(failureRate: string): Promise<void> {
+  worker = spawn(process.execPath, ['src/jobQueue/worker.ts'], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, FAKE_CHANNEL_FAILURE_RATE: failureRate },
+  });
+  // Wait until the worker has declared the queue and started consuming.
+  await new Promise<void>((resolve, reject) => {
+    worker.once('exit', (code) => reject(new Error(`worker exited early with code ${code}`)));
+    worker.stdout!.on('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('Waiting for messages')) resolve();
+    });
+  });
+}
+
+async function stopWorker(): Promise<void> {
+  worker.removeAllListeners('exit');
+  const exited = new Promise((resolve) => worker.once('exit', resolve));
+  worker.kill('SIGTERM');
+  await exited;
+}
+
 async function getStatus(id: string): Promise<string | undefined> {
   const { rows } = await db.query<{ status: string }>(
     'SELECT status FROM notifications WHERE id = $1',
@@ -58,22 +79,9 @@ describe('worker', () => {
     connection = await amqb.connect(config.RABBITMQ_URL);
     channel = await connection.createChannel();
     await channel.assertQueue(QUEUE, queueOptions);
-
-    worker = spawn(process.execPath, ['src/jobQueue/worker.ts'], {
-      stdio: ['ignore', 'pipe', 'inherit'],
-    });
-    // Wait until the worker has declared the queue and started consuming.
-    await new Promise<void>((resolve, reject) => {
-      worker.once('exit', (code) => reject(new Error(`worker exited early with code ${code}`)));
-      worker.stdout!.on('data', (chunk: Buffer) => {
-        if (chunk.toString().includes('Waiting for messages')) resolve();
-      });
-    });
   });
 
   afterAll(async () => {
-    worker.removeAllListeners('exit');
-    worker.kill('SIGTERM');
     await channel.close();
     await connection.close();
     // notifications.user_id is ON DELETE RESTRICT, so delete the notifications first.
@@ -82,20 +90,44 @@ describe('worker', () => {
     await db.end();
   });
 
-  it('marks a pending notification as sent after its id is queued', async () => {
-    const id = await createPendingNotification();
-    assert.equal(await getStatus(id), NotificationStatus.Pending);
+  describe('with the fake channel working', () => {
+    beforeAll(() => startWorker('0'));
+    afterAll(stopWorker);
 
-    channel.sendToQueue(QUEUE, Buffer.from(id));
+    it('marks a pending notification as sent after its id is queued', async () => {
+      const id = await createPendingNotification();
+      assert.equal(await getStatus(id), NotificationStatus.Pending);
 
-    await waitForStatus(id, NotificationStatus.Sent);
+      channel.sendToQueue(QUEUE, Buffer.from(id));
+
+      await waitForStatus(id, NotificationStatus.Sent);
+    });
+
+    it('survives an id that has no row and still processes the next message', async () => {
+      channel.sendToQueue(QUEUE, Buffer.from(crypto.randomUUID()));
+      const id = await createPendingNotification();
+      channel.sendToQueue(QUEUE, Buffer.from(id));
+
+      await waitForStatus(id, NotificationStatus.Sent);
+    });
   });
 
-  it('survives an id that has no row and still processes the next message', async () => {
-    channel.sendToQueue(QUEUE, Buffer.from(crypto.randomUUID()));
-    const id = await createPendingNotification();
-    channel.sendToQueue(QUEUE, Buffer.from(id));
+  describe('with the fake channel forced to fail', () => {
+    beforeAll(() => startWorker('1'));
+    afterAll(stopWorker);
 
-    await waitForStatus(id, NotificationStatus.Sent);
+    it('marks the notification failed and records the error', async () => {
+      const id = await createPendingNotification();
+
+      channel.sendToQueue(QUEUE, Buffer.from(id));
+
+      await waitForStatus(id, NotificationStatus.Failed);
+      const { rows } = await db.query(
+        'SELECT last_error, attempts FROM notifications WHERE id = $1',
+        [id],
+      );
+      assert.equal(rows[0].last_error, 'FakeChannel forced failure');
+      assert.equal(rows[0].attempts, 1);
+    });
   });
 });

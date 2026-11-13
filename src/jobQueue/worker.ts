@@ -1,8 +1,10 @@
 import amqb from 'amqplib';
 import { logger } from '../logger.ts';
 import { pool } from '../db.ts';
+import { createNotificationRepo } from '../notificationRepo.ts';
 import { createMessageHandler } from './handleNotification.ts';
 import { config } from '../envConfig.ts';
+import { FakeChannel } from '../channels/fakeChannel.ts';
 import { emailQueue, queueOptions } from './config.ts';
 
 const connection = await amqb.connect(config.RABBITMQ_URL);
@@ -12,7 +14,11 @@ await channel.assertQueue(emailQueue, queueOptions);
 
 console.log(' [*] Waiting for messages in %s. To exit press CTRL+C', emailQueue);
 
-const handleMessage = createMessageHandler({ pool, logger });
+const handleMessage = createMessageHandler({
+  repo: createNotificationRepo(pool),
+  logger,
+  channel: new FakeChannel({ failureRate: config.FAKE_CHANNEL_FAILURE_RATE, logger }),
+});
 
 channel.consume(
   emailQueue,
