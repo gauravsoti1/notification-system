@@ -2,6 +2,46 @@
 
 Grouped by branch, newest branch first. Each branch section has a heading with the branch name and a one-line summary.
 
+## NS-14: Channel interface with a fake implementation
+
+### Q: Can a helper like `recordResult` live inside `createMessageHandler` to reduce parameters, and what bug showed up when it was a top-level function?
+
+A: Yes. Defined inside `createMessageHandler`, a helper closes over `repo` and `logger`, so it only needs `(notificationId, sendResult)` instead of a deps object.
+
+- **Shape:** in `src/jobQueue/handleNotification.ts`, `handleMessage` is now a short sequence: `loadNotificationToSend` (before the send), `channel.send`, `recordResult` (after the send). NS-15 and NS-16 (requeue, backoff) will change `recordResult` only.
+- **Missing `await`:** the top-level version was called as `recordResult({ ... })` with no `await`. The handler returned before `markSent` or `markFailed` finished, and an error inside would be an unhandled rejection that skips the try/catch in `worker.ts`. The unit tests still passed because the fakes resolve instantly. It is now `await recordResult(record.id, sendResult)`.
+- **Trade-off:** nested helpers are recreated per `createMessageHandler` call (once per worker, so negligible) and can only be tested through `handleMessage`, which is what the tests already do.
+- General JavaScript/Node reasoning, not from docs.
+
+### Q: What is the best way to extract the early returns from a big handler, and what should the helper be called?
+
+A: Put the guards in one helper that returns the thing to process, or `null` after logging why there is nothing to do. The handler keeps one `if (!record) return;` and then the main path.
+
+- **Guards moved:** no message, non-UUID body, missing row, already `sent`. Each is a one-line check that logs and returns `null`.
+- **Not a reason code:** returning `{ skip: 'already_sent' }` is more structure than needed because nothing branches on the reason; the log line already says why.
+- **Early returns, not nesting:** flat guard clauses keep the main path unindented. The handler was already written this way, so this was about moving them out, not changing the style.
+- **Naming:** a name must say it loads from the DB and what the result is for. `loadNotificationToSend` was chosen. `validate…`/`check…` hide the DB read, `get…` suggests a plain lookup, and `loadPendingNotification` would be wrong once retries can resend a `failed` row.
+- Design opinion, not from docs.
+
+### Q: Why move the SQL into a repository file (`notificationRepo.ts`)?
+
+A: So the handler calls named operations (`findById`, `markSent`, `markFailed`) and knows nothing about SQL, and so each layer can be tested the right way.
+
+- **Handler unit tests** fake the repo with `vi.fn()`: no SQL strings or regexes, no database. `tests/unit/handleNotification.test.ts`.
+- **The SQL** is tested once, against the real Postgres, in `tests/integration/notificationRepo.test.ts` (each test rolled back). Moving SQL out of the unit tests would otherwise leave it untested.
+- **Mapping in one place:** `findById` turns `user_id` into `userId`, so the handler never touches raw column names. `markSent` and `markFailed` return `true` or `false` for "a row matched", so the handler can still warn on a miss.
+- **Cost:** one more file and an interface to keep in sync. It pays off once more code (retry logic in NS-15/16) needs these queries. For a single query it would be more than needed.
+- General design pattern (repository), not from docs.
+
+### Q: Why does the handler take `logger` as a parameter instead of importing it?
+
+A: Dependency injection, so tests can pass a fake and assert on what was logged. `repo` and `channel` are injected for the same reason.
+
+- **Import side effects:** `src/logger.ts` imports `envConfig.ts`, which validates the environment and calls `process.exit(1)` when a variable is missing, and in development starts a `pino-pretty` transport. A unit test that imported it would need a valid `.env`.
+- **Alternative:** import the logger directly and use `vi.mock('../logger.ts')` in tests. A logger is a cross-cutting utility, not a real external dependency, so importing it is common and fine; injection is the weakest case for it.
+- It stays injected here only because the tests assert on log calls (`'send failed'`, `'notification marked sent'`).
+- General design reasoning, not from docs.
+
 ## NS-13: Publish to RabbitMQ and worker logs a fake send
 
 ### Q: How do I stop a bad message body or an unexpected error from crashing the worker?
