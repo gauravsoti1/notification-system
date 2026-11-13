@@ -20,6 +20,8 @@ const envSchema = z.object({
 
   RABBITMQ_USER: z.string().min(1),
   RABBITMQ_PASSWORD: z.string().min(1),
+  // Chance (0 to 1) that the fake notification channel fails a send. For trying out failure handling.
+  FAKE_CHANNEL_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
   RABBITMQ_URL: z.url({ protocol: /^amqp$/ }),
 });
 
