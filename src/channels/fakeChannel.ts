@@ -1,5 +1,6 @@
 import type { Logger } from 'pino';
-import type { Channel, Notification, SendResult } from './types.ts';
+import type { Notification } from '../models/notification.ts';
+import type { Channel, SendResult } from './types.ts';
 
 export interface FakeChannelOptions {
   // Probability (0 to 1) that a send fails. 0 never fails, 1 always fails.

@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import pg from 'pg';
 import { config } from '../../src/envConfig.ts';
-import { createNotificationRepo } from '../../src/notificationRepo.ts';
-import { NotificationStatus } from '../../src/notificationStatus.ts';
+import { createNotificationRepo } from '../../src/repos/notificationRepo.ts';
+import { NotificationStatus } from '../../src/models/notification.ts';
 
 // Runs the repo's SQL against the real Compose Postgres. Each test is rolled back.
 const client = new pg.Client({ connectionString: config.DATABASE_URL });

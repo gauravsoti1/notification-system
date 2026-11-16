@@ -2,8 +2,7 @@ import type { ConsumeMessage } from 'amqplib';
 import { describe, expect, it, vi } from 'vitest';
 import type { SendResult } from '../../src/channels/types.ts';
 import { createMessageHandler } from '../../src/jobQueue/handleNotification.ts';
-import type { NotificationRecord } from '../../src/notificationRepo.ts';
-import { NotificationStatus } from '../../src/notificationStatus.ts';
+import { NotificationStatus, type NotificationRecord } from '../../src/models/notification.ts';
 
 // Unit tests: the repo, channel and logger are fakes, so no Postgres or RabbitMQ is needed.
 // The SQL itself is tested in tests/integration/notificationRepo.test.ts.
@@ -17,6 +16,7 @@ const record = (status: string): NotificationRecord => ({
   payload: { message: 'hi' },
   userId: 'c3b0efe7-928a-41e2-a070-5c085f7612d0',
   status,
+  attempts: 0,
 });
 
 function setup({
@@ -48,8 +48,9 @@ describe('createMessageHandler', () => {
   it('loads the notification by the message body, sends it, then marks it sent', async () => {
     const { handle, repo, send } = setup();
 
-    await handle(message(id));
+    const response = await handle(message(id));
 
+    expect(response).toBe('ack');
     expect(repo.findById).toHaveBeenCalledWith(id);
     expect(send).toHaveBeenCalledWith({
       id,
@@ -73,8 +74,9 @@ describe('createMessageHandler', () => {
   it('logs a warning when marking sent matched no row', async () => {
     const { handle, warn } = setup({ markSent: false });
 
-    await handle(message(id));
+    const response = await handle(message(id));
 
+    expect(response).toBe('ack');
     expect(warn).toHaveBeenCalledWith(
       { notificationId: id },
       'no notification row found to update',
@@ -86,8 +88,9 @@ describe('createMessageHandler', () => {
       sendResult: { ok: false, retryable: true, error: 'provider timeout' },
     });
 
-    await handle(message(id));
+    const response = await handle(message(id));
 
+    expect(response).toBe('requeue');
     expect(repo.markFailed).toHaveBeenCalledWith(id, 'provider timeout');
     expect(repo.markSent).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(
@@ -99,8 +102,9 @@ describe('createMessageHandler', () => {
   it('warns and skips the send and update when the notification does not exist', async () => {
     const { handle, repo, send, info, warn } = setup({ found: null });
 
-    await handle(message(id));
+    const response = await handle(message(id));
 
+    expect(response).toBe('ack');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining(id));
     expect(info).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
@@ -110,8 +114,9 @@ describe('createMessageHandler', () => {
   it('skips the send and update when the notification is already sent', async () => {
     const { handle, repo, send, info } = setup({ found: record(NotificationStatus.Sent) });
 
-    await handle(message(id));
+    const response = await handle(message(id));
 
+    expect(response).toBe('ack');
     expect(info).toHaveBeenCalledWith(expect.stringContaining('already sent'));
     expect(send).not.toHaveBeenCalled();
     expect(repo.markSent).not.toHaveBeenCalled();
@@ -120,8 +125,9 @@ describe('createMessageHandler', () => {
   it('drops a message whose body is not a UUID without touching the repo', async () => {
     const { handle, repo, warn } = setup();
 
-    await handle(message('First email'));
+    const response = await handle(message('First email'));
 
+    expect(response).toBe('ack');
     expect(repo.findById).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('First email'));
   });
@@ -129,8 +135,9 @@ describe('createMessageHandler', () => {
   it('does nothing but log when the consumer is cancelled (null message)', async () => {
     const { handle, repo, info } = setup();
 
-    await handle(null);
+    const response = await handle(null);
 
+    expect(response).toBe('ack');
     expect(repo.findById).not.toHaveBeenCalled();
     expect(info).toHaveBeenCalledWith('Empty message in the queue');
   });

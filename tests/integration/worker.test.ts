@@ -5,7 +5,7 @@ import amqb, { type Channel, type ChannelModel } from 'amqplib';
 import pg from 'pg';
 import { config } from '../../src/envConfig.ts';
 import { emailQueue, queueOptions } from '../../src/jobQueue/config.ts';
-import { NotificationStatus } from '../../src/notificationStatus.ts';
+import { NotificationStatus } from '../../src/models/notification.ts';
 
 // End-to-end check of the worker against the real Compose Postgres and RabbitMQ.
 // The worker runs as a child process, because src/jobQueue/worker.ts connects and consumes on import.

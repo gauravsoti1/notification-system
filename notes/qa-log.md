@@ -2,6 +2,67 @@
 
 Grouped by branch, newest branch first. Each branch section has a heading with the branch name and a one-line summary.
 
+## NS-15: Manual ack in the worker
+
+### Q: How do I find the worker's PID to kill it, and why doesn't plain `ps` show it?
+A: Run `pgrep -af worker.ts` (or `ps aux | grep worker.ts`) from any terminal. Plain `ps` lists only processes in the current terminal (`pts/6` in this case), and the worker runs in another one.
+
+- **Three processes show up:** `npm run worker` starts `sh -c tsx ...`, then `node .../tsx ...`, then a child `node --require .../preflight.cjs --import .../loader.mjs src/jobQueue/worker.ts`. The last one is the worker itself; kill that PID. `pkill -9 -f worker.ts` kills all of them.
+- **Why `kill -9`:** it is a real crash (no signal handler runs), which is what the "die before the ack" check needs. Ctrl+C is a graceful stop.
+- **The PID changes** every time the worker restarts, so look it up again.
+- General Linux knowledge, not from docs.
+
+### Q: What happens if the worker dies after sending but before acking? (manual check, ticket step 4)
+A: RabbitMQ puts the unacked message back on the queue and delivers it again, so the work can run twice (at-least-once delivery).
+
+- **What was seen:** with a temporary 15 s delay after `handleMessage` in `src/jobQueue/worker.ts`, the RabbitMQ UI showed `Unacked = 1`. After `kill -9` on the node process (not the `sh`/`tsx` wrappers) it went to `Ready = 1`, `Returned = 1`, `Consumers = 0`. The delay line was removed afterwards.
+- **Why it is a duplicate:** the row was already `sent` before the kill, so the redelivery hits the "already sent" skip in `loadNotificationToSend` (`src/jobQueue/handleNotification.ts`) and is acked. If the crash came between `channel.send` and `markSent`, the real channel would send a second time. Fixing that needs an idempotency key on the provider side; the handler cannot fully prevent it.
+- The redelivered log line was expected, not checked by Claude (the user ran the restart).
+- RabbitMQ behaviour is general knowledge plus what the UI showed, not from docs.
+
+### Q: What happens when the channel always fails and the handler requeues? (manual check, ticket step 3)
+A: The message comes straight back and is retried in a tight loop, with no delay and no limit.
+
+- **What was seen:** with `FAKE_CHANNEL_FAILURE_RATE=1`, one notification reached `status = failed`, `attempts = 1517`, `last_error` from `FakeChannel` in about 16 s (created 10:59:37, updated 10:59:53), roughly 95 attempts a second.
+- **Why:** `recordResult` returns `requeue` after `markFailed`, and `nack(msg, false, true)` puts the message back at once. Backoff, a retry cap and a dead-letter queue are the next phase (NS-16 onward), not this ticket.
+- **Delivery limit:** the quorum queue page showed `Delivery limit 20`, yet `attempts` passed 1500, so don't rely on it to stop the loop. Not investigated why.
+- After the test, the message is still in the queue; with the rate back at 0 it is sent and marked `sent`.
+
+### Q: Why can't I test `handleAckOnResponse` by exporting it from `worker.ts`?
+A: Importing `worker.ts` runs it. Its top level connects to RabbitMQ (`amqb.connect`), asserts the queue and starts `consume`, so a unit test would need the real services and a valid `.env`.
+
+- **Second problem:** the function used the module-level `channel`, so a test could not pass a fake one.
+- **Fix:** it now lives in `src/jobQueue/utils.ts` and takes the channel as a parameter (`handleAckOnResponse(channel, response, msg)`), the same dependency-injection idea as `createMessageHandler`. The file has no side effects on import.
+- **Decision:** no separate tests for `utils.ts`; the mapping (`ack`, `nack` without requeue, `nack` with requeue) is covered by the manual checks.
+- General JavaScript/Node reasoning, not from docs.
+
+### Q: Why is there a `NotificationRecord` as well as `Notification`?
+A: `Notification` is what a channel needs to send (`id`, `channel`, `payload`, `userId`). `NotificationRecord` adds the row's lifecycle fields (`status`, `attempts`) that the handler needs, for example to skip rows already `sent`.
+
+- **Why keep both:** channels see only the minimum. The handler builds the `Notification` from the record in `channel.send({...})`.
+- **Alternative:** add the fields to `Notification` and delete the record type. That is simpler, but channels (and `FakeChannel` tests) then see fields they never use.
+- Both types are in `src/models/notification.ts`.
+- Design opinion, not from docs.
+
+### Q: Where should the `Notification` type live, and what does "channels depend on persistence" mean?
+A: In `src/models/`, with the repo in `src/repos/`. Types and constants go in `models/`, and `models/` imports nothing from the other folders.
+
+- **What the phrase meant:** if `Notification` were defined in the repo file, `channels/types.ts` and `fakeChannel.ts` would import from the database file. A channel (email, SMS, push) would then have a source dependency on Postgres code. It is `import type`, so nothing breaks at runtime, but moving the repo later would force channel changes. Before the move the repo imported from `channels/types.ts`, which was the same problem the other way round.
+- **Result:** `src/models/notification.ts` holds `Notification`, `NotificationRecord` and `NotificationStatus` (merged in at the user's request); `src/repos/notificationRepo.ts` holds the SQL. Channels, repo and handler all import from `models/`.
+- **Why not the repo inside `models/`:** a model is the shape of the data; the repo is code that reads and writes it.
+- Design opinion, not from docs.
+
+### Q: What is the difference between `noAck` true and false, and when should each be used?
+
+A: `noAck: true` means automatic acknowledgement: the broker treats a message as done the moment it sends it, so it is gone from the queue even if the consumer crashes or fails. `noAck: false` means manual acknowledgement: the message stays unacked until the consumer calls `channel.ack(msg)`, and RabbitMQ redelivers it if the consumer dies or the channel closes first.
+
+- **Use `true`** when losing a message is acceptable and speed matters more, e.g. metrics, ephemeral events, or anything safely regenerated.
+- **Use `false`** when every message must be processed, as with notifications. Ack only after the work is recorded (`markSent` / `markFailed`).
+- **Failure handling with `false`:** `channel.nack(msg, false, requeue)` or `channel.reject(msg, requeue)` lets the consumer decide between requeueing and dropping or dead-lettering. Forgetting to ack leaves messages unacked, and they pile up until the channel closes.
+- **Delivery guarantee:** manual ack gives at-least-once delivery, so a message can arrive twice (crash after the work but before the ack). The handler must be safe to repeat; ours skips rows already `sent`.
+- **Repo:** `src/jobQueue/worker.ts` passes `noAck: false` to `channel.consume`. Before NS-15 the worker used auto-ack, so a failed message was lost and its row stayed `pending`. amqplib's default for `noAck` is already `false`.
+- General RabbitMQ/amqplib knowledge, not checked against docs in this session.
+
 ## NS-14: Channel interface with a fake implementation
 
 ### Q: Can a helper like `recordResult` live inside `createMessageHandler` to reduce parameters, and what bug showed up when it was a top-level function?
