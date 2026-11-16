@@ -2,8 +2,8 @@ import type { ConsumeMessage } from 'amqplib';
 import type { Logger } from 'pino';
 import z from 'zod';
 import type { Channel, SendResult } from '../channels/types.ts';
-import { NotificationStatus } from '../notificationStatus.ts';
-import type { NotificationRecord, NotificationRepo } from '../notificationRepo.ts';
+import { NotificationStatus, type NotificationRecord } from '../models/notification.ts';
+import { type NotificationRepo } from '../repos/notificationRepo.ts';
 
 // Dependencies are passed in so tests can swap in fakes. Only what the handler uses is required.
 export interface HandlerDeps {
@@ -11,6 +11,10 @@ export interface HandlerDeps {
   logger: Pick<Logger, 'info' | 'warn'>;
   channel: Channel;
 }
+
+export const responses = { ack: 'ack', nack: 'nack', requeue: 'requeue' } as const;
+
+export type Responses = (typeof responses)[keyof typeof responses];
 
 // Handles one queue message: its body is a notification id, which is sent through the injected channel and marked sent (or failed).
 export function createMessageHandler({ repo, logger, channel }: HandlerDeps) {
@@ -44,7 +48,7 @@ export function createMessageHandler({ repo, logger, channel }: HandlerDeps) {
   }
 
   // Records the outcome of a send on the row and logs it.
-  async function recordResult(notificationId: string, sendResult: SendResult): Promise<void> {
+  async function recordResult(notificationId: string, sendResult: SendResult): Promise<Responses> {
     if (!sendResult.ok) {
       // Retries are a later ticket; for now record the failure on the row.
       logger.warn(
@@ -52,19 +56,22 @@ export function createMessageHandler({ repo, logger, channel }: HandlerDeps) {
         'send failed',
       );
       await repo.markFailed(notificationId, sendResult.error);
-      return;
+      // Always requeue for now, so a failed send is never lost. A retry cap and dead-lettering come in a later ticket.
+      return responses.requeue;
     }
 
     if (await repo.markSent(notificationId)) {
       logger.info({ notificationId }, 'notification marked sent');
+      return responses.ack;
     } else {
       logger.warn({ notificationId }, 'no notification row found to update');
+      return responses.ack;
     }
   }
 
-  return async function handleMessage(msg: ConsumeMessage | null): Promise<void> {
+  return async function handleMessage(msg: ConsumeMessage | null): Promise<Responses> {
     const record = await loadNotificationToSend(msg);
-    if (!record) return;
+    if (!record) return responses.ack;
 
     const sendResult = await channel.send({
       id: record.id,
@@ -72,6 +79,7 @@ export function createMessageHandler({ repo, logger, channel }: HandlerDeps) {
       payload: record.payload,
       userId: record.userId,
     });
-    await recordResult(record.id, sendResult);
+    const response = await recordResult(record.id, sendResult);
+    return response;
   };
 }

@@ -1,9 +1,5 @@
 import type { Pool } from 'pg';
-import type { Notification } from './channels/types.ts';
-import { NotificationStatus } from './notificationStatus.ts';
-
-// A stored notification: what a channel needs to send, plus where it is in its lifecycle.
-export type NotificationRecord = Notification & { status: string };
+import { NotificationStatus, type NotificationRecord } from '../models/notification.ts';
 
 // The operations the worker needs. The SQL lives here so callers use named operations, and tests can fake them.
 export interface NotificationRepo {
@@ -17,7 +13,7 @@ export function createNotificationRepo(db: Pick<Pool, 'query'>): NotificationRep
   return {
     async findById(id) {
       const { rows } = await db.query(
-        `SELECT id, channel, payload, user_id, status FROM notifications WHERE id = $1`,
+        `SELECT id, channel, payload, user_id, status, attempts FROM notifications WHERE id = $1`,
         [id],
       );
       const row = rows[0];
@@ -28,6 +24,7 @@ export function createNotificationRepo(db: Pick<Pool, 'query'>): NotificationRep
         payload: row.payload,
         userId: row.user_id,
         status: row.status,
+        attempts: row.attempts,
       };
     },
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { FakeChannel } from '../../src/channels/fakeChannel.ts';
-import type { Notification } from '../../src/channels/types.ts';
+import type { Notification } from '../../src/models/notification.ts';
 
 const notification: Notification = {
   id: '9ca70dbd-addd-4ec5-8ab7-e5b8c768f884',
